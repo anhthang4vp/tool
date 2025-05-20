@@ -1,0 +1,194 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Phantom Wallet Integration</title>
+  <script src="https://cdn.jsdelivr.net/npm/@solana/web3.js@1.78.0/dist/index.iife.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.18.9/babel.min.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    if (typeof window.SolanaWeb3 === 'undefined') {
+      console.error('SolanaWeb3 is not defined. Please ensure the Solana web3.js script is loaded.');
+      throw new Error('Solana web3.js library not loaded.');
+    }
+
+    const { Connection, PublicKey, Transaction, SystemProgram } = window.SolanaWeb3;
+
+    const connectWallet = async () => {
+      if (!window.solana || !window.solana.isPhantom) {
+        throw new Error('Phantom wallet not detected. Please install the Phantom extension.');
+      }
+      try {
+        await window.solana.connect();
+        return window.solana.publicKey.toString();
+      } catch (error) {
+        console.error('Connection failed:', error);
+        throw error;
+      }
+    };
+
+    const getBalance = async (publicKeyStr) => {
+      const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+      try {
+        const publicKey = new PublicKey(publicKeyStr);
+        const balance = await connection.getBalance(publicKey);
+        return balance / 1e9;
+      } catch (error) {
+        console.error('Failed to fetch balance:', error);
+        throw error;
+      }
+    };
+
+    const executeTrade = async (publicKeyStr, recipientAddress, amount) => {
+      const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+      try {
+        const senderPublicKey = new PublicKey(publicKeyStr);
+        const recipientPublicKey = new PublicKey(recipientAddress);
+        const lamports = amount * 1e9;
+
+        const transaction = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: senderPublicKey,
+            toPubkey: recipientPublicKey,
+            lamports,
+          })
+        );
+
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = senderPublicKey;
+
+        const signedTransaction = await window.solana.signTransaction(transaction);
+        const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+        await connection.confirmTransaction(signature);
+        return signature;
+      } catch (error) {
+        console.error('Trade execution failed:', error);
+        throw error;
+      }
+    };
+
+    const App = () => {
+      const [publicKey, setPublicKey] = React.useState(null);
+      const [balance, setBalance] = React.useState(null);
+      const [recipient, setRecipient] = React.useState('');
+      const [amount, setAmount] = React.useState('');
+      const [message, setMessage] = React.useState('');
+
+      const handleConnect = async () => {
+        try {
+          const key = await connectWallet();
+          setPublicKey(key);
+          setMessage('Wallet connected!');
+          const bal = await getBalance(key);
+          setBalance(bal);
+        } catch (error) {
+          setMessage(error.message);
+        }
+      };
+
+      const handleTrade = async () => {
+        if (!publicKey || !recipient || !amount) {
+          setMessage('Please connect wallet and fill all fields.');
+          return;
+        }
+        try {
+          const signature = await executeTrade(publicKey, recipient, parseFloat(amount));
+          setMessage(`Transaction successful! Signature: ${signature}`);
+        } catch (error) {
+          setMessage(`Error: ${error.message}`);
+        }
+      };
+
+      return (
+        <div className="container mx-auto p-4">
+          <h1 className="text-2xl font-bold mb-4">Phantom Wallet Integration</h1>
+          {!publicKey ? (
+            <button
+              className="bg-blue-500 text-white px-4 py-2 rounded"
+              onClick={handleConnect}
+            >
+              Connect Phantom Wallet
+            </button>
+          ) : (
+            <div>
+              <p className="mb-2">Connected Wallet: {publicKey}</p>
+              <p className="mb-4">Balance: {balance !== null ? balance : 'Loading...'} SOL</p>
+              <div className="mb-4">
+                <input
+                  type="text"
+                  placeholder="Recipient Address"
+                  value={recipient}
+                  onChange={(e) => setRecipient(e.target.value)}
+                  className="border p-2 mr-2"
+                />
+                <input
+                  type="number"
+                  placeholder="Amount (SOL)"
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                  className="border p-2 mr-2"
+                />
+                <button
+                  className="bg-green-500 text-white px-4 py-2 rounded"
+                  onClick={handleTrade}
+                >
+                  Send SOL
+                </button>
+              </div>
+            </div>
+          )}
+          {message && <p className="mt-4 text-red-500">{message}</p>}
+        </div>
+      );
+    };
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
