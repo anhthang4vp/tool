@@ -1,0 +1,562 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Solana MEV Sniping Bot with Phantom Integration</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/solana-web3/1.93.3/solanaWeb3.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/axios/1.7.7/axios.min.js"></script>
+</head>
+<body>
+  <h1>Solana MEV Sniping Bot</h1>
+  <button id="connectWallet">Connect Phantom Wallet</button>
+  <p id="walletStatus">Wallet not connected</p>
+  <p id="balance">Balance: 0 SOL</p>
+  <div id="tradeStatus"></div>
+
+  <script>
+    // Configuration
+    const RPC_URL = "https://api.devnet.solana.com"; // Use devnet for testing
+    const JUPITER_API = "https://quote-api.jup.ag/v6/quote"; // Placeholder
+    const TWEETSCOUT_API = "https://api.tweetscout.io"; // Placeholder
+    const MIN_PROFIT_THRESHOLD = 0.01; // Minimum profit in SOL
+    const DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS = 1000000;
+    const DEFAULT_BRIBE_FEE_MICRO_LAMPORTS = 500000;
+    const MIN_PRIORITY_FEE_MICRO_LAMPORTS = 500000;
+    const MAX_PRIORITY_FEE_MICRO_LAMPORTS = 5000000;
+    const CONGESTION_THRESHOLD = 0.8;
+    const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const SWAP_PROGRAM_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+    const LIQUIDITY_LOCK_THRESHOLD = 0.8;
+    const HOLDER_CONCENTRATION_THRESHOLD = 0.5;
+    const TWEETSCOUT_SCORE_THRESHOLD = 50;
+    const LIQUIDITY_DROP_THRESHOLD = 0.5;
+    const LIQUIDITY_CHECK_INTERVAL = 60;
+    const DEV_WALLET_ACTIVITY_THRESHOLD = 0.1;
+    const WHALE_THRESHOLD = 0.05;
+    const ABNORMAL_TRANSFER_COUNT = 10;
+    const ABNORMAL_TRANSFER_WINDOW = 60;
+    const AUTO_TRADE_CONFIG = {
+      buy_price_threshold: 0.9,
+      sell_price_threshold: 1.1,
+      volume_threshold: 10000,
+      profit_target_percent: 20.0,
+      check_interval: 30
+    };
+
+    // Data stores
+    let wallet = null;
+    let publicKey = null;
+    let liquidity_history = {};
+    let dev_wallets = {};
+    let transaction_history = {};
+    let positions = {};
+
+    // Initialize Solana connection
+    const connection = new solanaWeb3.Connection(RPC_URL, "confirmed");
+
+    // Connect to Phantom wallet
+    async function connectWallet() {
+      try {
+        if (!window.solana || !window.solana.isPhantom) {
+          throw new Error("Phantom wallet not detected. Please install the extension.");
+        }
+        wallet = window.solana;
+        await wallet.connect();
+        publicKey = wallet.publicKey;
+        document.getElementById("walletStatus").textContent = `Connected: ${publicKey.toBase58()}`;
+        await updateBalance();
+        wallet.on("disconnect", () => {
+          document.getElementById("walletStatus").textContent = "Wallet disconnected";
+          publicKey = null;
+          wallet = null;
+        });
+      } catch (error) {
+        console.error("Error connecting to Phantom:", error);
+        document.getElementById("walletStatus").textContent = `Error: ${error.message}`;
+      }
+    }
+
+    // Update balance display
+    async function updateBalance() {
+      if (!publicKey) return;
+      try {
+        const balance = await connection.getBalance(publicKey);
+        document.getElementById("balance").textContent = `Balance: ${(balance / solanaWeb3.LAMPORTS_PER_SOL).toFixed(4)} SOL`;
+      } catch (error) {
+        console.error("Error fetching balance:", error);
+        document.getElementById("balance").textContent = "Error fetching balance";
+      }
+    }
+
+    // Calculate dynamic priority fee
+    async function calculateDynamicPriorityFee() {
+      try {
+        const recentFees = await connection.getRecentPrioritizationFees();
+        if (recentFees.length) {
+          const avgFee = recentFees.reduce((sum, fee) => sum + fee.prioritizationFee, 0) / recentFees.length;
+          const congestion = Math.min(avgFee / MAX_PRIORITY_FEE_MICRO_LAMPORTS, 1.0);
+          const baseFee = DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS + DEFAULT_BRIBE_FEE_MICRO_LAMPORTS;
+          let dynamicFee = congestion > CONGESTION_THRESHOLD
+            ? baseFee * (1 + (congestion - CONGESTION_THRESHOLD) * 2)
+            : baseFee * (1 - (CONGESTION_THRESHOLD - congestion));
+          return Math.max(MIN_PRIORITY_FEE_MICRO_LAMPORTS, Math.min(dynamicFee, MAX_PRIORITY_FEE_MICRO_LAMPORTS));
+        }
+        return DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS + DEFAULT_BRIBE_FEE_MICRO_LAMPORTS;
+      } catch (error) {
+        console.error("Error calculating dynamic fee:", error);
+        return DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS + DEFAULT_BRIBE_FEE_MICRO_LAMPORTS;
+      }
+    }
+
+    // Monitor mempool for token swaps
+    async function monitorMempool() {
+      try {
+        const ws = new WebSocket(RPC_URL.replace("https", "wss"));
+        ws.onopen = () => {
+          ws.send(JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "logsSubscribe",
+            params: [{ mentions: [SWAP_PROGRAM_ID] }, { commitment: "confirmed" }]
+          }));
+        };
+        ws.onmessage = async (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.result) return; // Ignore subscription confirmation
+            const transaction = parseTokenSwap(data.params.result.value.logs);
+            if (transaction) {
+              const tokenMint = transaction.token_out;
+              const tokenSafe = await analyzeTokenSafety(tokenMint);
+              if (tokenSafe) {
+                const opportunity = analyzeMevOpportunity(transaction);
+                if (opportunity && opportunity.profit > MIN_PROFIT_THRESHOLD) {
+                  monitorRugPull(tokenMint);
+                  monitorTransactions(tokenMint);
+                  monitorAutoTrade(tokenMint);
+                  await executeSnipe(opportunity);
+                } else {
+                  document.getElementById("tradeStatus").textContent += `Token ${tokenMint} failed safety checks\n`;
+                }
+              }
+            }
+          } catch (error) {
+            console.error("Error processing mempool data:", error);
+          }
+        };
+        ws.onerror = (error) => console.error("WebSocket error:", error);
+      } catch (error) {
+        console.error("Error in mempool monitoring:", error);
+      }
+    }
+
+    // Parse token swap logs
+    function parseTokenSwap(logs) {
+      try {
+        if (logs.some(log => log.includes("Program log: Instruction: Swap"))) {
+          return {
+            program_id: SWAP_PROGRAM_ID,
+            token_in: "SOL",
+            token_out: "USDC",
+            amount_in: 1.0,
+            amount_out: 100.0,
+            price: 100.0,
+            token_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+          };
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    }
+
+    // Analyze token safety
+    async function analyzeTokenSafety(tokenMint) {
+      try {
+        const liquidityLocked = await checkLiquidityLock(tokenMint);
+        const holderDistributionSafe = await checkHolderDistribution(tokenMint);
+        const contractSafe = await checkContractFunctions(tokenMint);
+        const socialScore = await checkSocialPresence(tokenMint);
+
+        if (!(tokenMint in liquidity_history)) {
+          liquidity_history[tokenMint] = [[Date.now() / 1000, 0.9]];
+        }
+        if (!(tokenMint in transaction_history)) {
+          transaction_history[tokenMint] = [];
+        }
+        if (!(tokenMint in positions)) {
+          positions[tokenMint] = { entry_price: 0.0, amount: 0.0 };
+        }
+        dev_wallets[tokenMint] = await identifyDevWallets(tokenMint);
+
+        return liquidityLocked && holderDistributionSafe && contractSafe && socialScore >= TWEETSCOUT_SCORE_THRESHOLD;
+      } catch (error) {
+        console.error(`Error analyzing token ${tokenMint}:`, error);
+        return false;
+      }
+    }
+
+    // Placeholder functions for safety checks
+    async function checkLiquidityLock(tokenMint) {
+      try {
+        const response = await connection.getAccountInfo(new solanaWeb3.PublicKey(tokenMint));
+        return response ? 0.9 >= LIQUIDITY_LOCK_THRESHOLD : false;
+      } catch {
+        return false;
+      }
+    }
+
+    async function checkHolderDistribution(tokenMint) {
+      try {
+        const response = await connection.getTokenAccountsByOwner(new solanaWeb3.PublicKey(tokenMint));
+        return response ? 0.3 < HOLDER_CONCENTRATION_THRESHOLD : false;
+      } catch {
+        return false;
+      }
+    }
+
+    async function checkContractFunctions(tokenMint) {
+      try {
+        const response = await connection.getAccountInfo(new solanaWeb3.PublicKey(tokenMint));
+        return response ? true : false; // Placeholder: assumes no mint authority
+      } catch {
+        return false;
+      }
+    }
+
+    async function checkSocialPresence(tokenMint) {
+      try {
+        const response = await axios.get(TWEETSCOUT_API, { params: { token_mint: tokenMint } });
+        return response.data.score || 0;
+      } catch {
+        return 0;
+      }
+    }
+
+    async function identifyDevWallets(tokenMint) {
+      try {
+        const response = await connection.getSignaturesForAddress(new solanaWeb3.PublicKey(tokenMint));
+        return response.length ? [response[0].signature] : [];
+      } catch {
+        return [];
+      }
+    }
+
+    // Monitor rug pull
+    async function monitorRugPull(tokenMint) {
+      try {
+        while (true) {
+          const response = await connection.getAccountInfo(new solanaWeb3.PublicKey(tokenMint));
+          if (response) {
+            const currentLiquidity = 0.9; // Placeholder
+            const currentTime = Date.now() / 1000;
+            liquidity_history[tokenMint].push([currentTime, currentLiquidity]);
+            const recentHistory = liquidity_history[tokenMint].filter(x => currentTime - x[0] <= LIQUIDITY_CHECK_INTERVAL);
+            if (recentHistory.length) {
+              const maxLiquidity = Math.max(...recentHistory.map(x => x[1]));
+              if (currentLiquidity < maxLiquidity * LIQUIDITY_DROP_THRESHOLD) {
+                document.getElementById("tradeStatus").textContent += `Rug pull detected for ${tokenMint}: Liquidity dropped by 50%\n`;
+                await autoSellToken(tokenMint);
+                return;
+              }
+            }
+            for (const devWallet of dev_wallets[tokenMint] || []) {
+              if (await checkDevWalletActivity(tokenMint, devWallet)) {
+                document.getElementById("tradeStatus").textContent += `Rug pull detected for ${tokenMint}: Suspicious dev wallet activity\n`;
+                await autoSellToken(tokenMint);
+                return;
+              }
+            }
+          }
+          await new Promise(resolve => setTimeout(resolve, LIQUIDITY_CHECK_INTERVAL * 1000));
+        }
+      } catch (error) {
+        console.error(`Error monitoring rug pull for ${tokenMint}:`, error);
+      }
+    }
+
+    async function checkDevWalletActivity(tokenMint, devWallet) {
+      try {
+        const response = await connection.getTokenAccountBalance(new solanaWeb3.PublicKey(devWallet));
+        if (response.value) {
+          const balance = response.value.uiAmount;
+          const totalSupply = 1_000_000; // Placeholder
+          return balance / totalSupply > DEV_WALLET_ACTIVITY_THRESHOLD;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    }
+
+    // Monitor transactions
+    async function monitorTransactions(tokenMint) {
+      try {
+        const ws = new WebSocket(RPC_URL.replace("https", "wss"));
+        ws.onopen = () => {
+          ws.send(JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "accountSubscribe",
+            params: [tokenMint, { commitment: "confirmed" }]
+          }));
+        };
+        ws.onmessage = async (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.result) return;
+            const txData = data.params.result.value;
+            const parsedTx = await parseTransaction(txData, tokenMint);
+            if (parsedTx) {
+              const currentTime = Date.now() / 1000;
+              transaction_history[tokenMint].push([currentTime, parsedTx.wallet, parsedTx.amount, parsedTx.is_buy]);
+              if (parsedTx.amount / 1_000_000 > WHALE_THRESHOLD) {
+                document.getElementById("tradeStatus").textContent += `Whale ${parsedTx.is_buy ? "buy" : "sell"} detected for ${tokenMint}: ${parsedTx.amount} tokens\n`;
+                if (!parsedTx.is_buy) await autoSellToken(tokenMint);
+              }
+              if (await detectAbnormalBehavior(tokenMint, parsedTx.wallet)) {
+                document.getElementById("tradeStatus").textContent += `Abnormal wallet behavior detected for ${tokenMint}\n`;
+                await autoSellToken(tokenMint);
+              }
+            }
+          } catch (error) {
+            console.error(`Error processing transaction for ${tokenMint}:`, error);
+          }
+        };
+      } catch (error) {
+        console.error(`Error in transaction monitoring for ${tokenMint}:`, error);
+      }
+    }
+
+    async function parseTransaction(txData, tokenMint) {
+      try {
+        return { wallet: publicKey.toBase58(), amount: 50000, is_buy: true }; // Placeholder
+      } catch {
+        return null;
+      }
+    }
+
+    async function detectAbnormalBehavior(tokenMint, walletAddress) {
+      try {
+        const currentTime = Date.now() / 1000;
+        const recentTxs = transaction_history[tokenMint].filter(
+          tx => tx[1] === walletAddress && currentTime - tx[0] <= ABNORMAL_TRANSFER_WINDOW
+        );
+        if (recentTxs.length > ABNORMAL_TRANSFER_COUNT) return true;
+        const buys = recentTxs.filter(tx => tx[3]).length;
+        const sells = recentTxs.length - buys;
+        return buys > 0 && sells > 0;
+      } catch {
+        return false;
+      }
+    }
+
+    // Auto-trade monitoring
+    async function monitorAutoTrade(tokenMint) {
+      try {
+        while (true) {
+          const currentPrice = await getCurrentPrice(tokenMint);
+          const currentVolume = await getCurrentVolume(tokenMint);
+          if (currentPrice === null || currentVolume === null) {
+            await new Promise(resolve => setTimeout(resolve, AUTO_TRADE_CONFIG.check_interval * 1000));
+            continue;
+          }
+          const marketPrice = await getMarketPrice(tokenMint, "USDC", 1.0);
+          if (currentPrice <= AUTO_TRADE_CONFIG.buy_price_threshold * marketPrice &&
+              currentVolume >= AUTO_TRADE_CONFIG.volume_threshold) {
+            document.getElementById("tradeStatus").textContent += `Auto-buy triggered for ${tokenMint}: Price=${currentPrice}, Volume=${currentVolume}\n`;
+            await executeAutoBuy(tokenMint, currentPrice);
+          }
+          if (currentPrice >= AUTO_TRADE_CONFIG.sell_price_threshold * marketPrice ||
+              currentVolume >= AUTO_TRADE_CONFIG.volume_threshold) {
+            document.getElementById("tradeStatus").textContent += `Auto-sell triggered for ${tokenMint}: Price=${currentPrice}, Volume=${currentVolume}\n`;
+            await autoSellToken(tokenMint);
+          }
+          if (tokenMint in positions && positions[tokenMint].amount > 0) {
+            const entryPrice = positions[tokenMint].entry_price;
+            if (currentPrice >= entryPrice * (1 + AUTO_TRADE_CONFIG.profit_target_percent / 100)) {
+              document.getElementById("tradeStatus").textContent += `Profit target reached for ${tokenMint}: Current=${currentPrice}, Entry=${entryPrice}\n`;
+              await autoSellToken(tokenMint);
+            }
+          }
+          await new Promise(resolve => setTimeout(resolve, AUTO_TRADE_CONFIG.check_interval * 1000));
+        }
+      } catch (error) {
+        console.error(`Error in auto-trade monitoring for ${tokenMint}:`, error);
+      }
+    }
+
+    async function executeAutoBuy(tokenMint, currentPrice, manualFee = null) {
+      if (!wallet || !publicKey) {
+        document.getElementById("tradeStatus").textContent += "Error: Wallet not connected\n";
+        return;
+      }
+      try {
+        const transaction = new solanaWeb3.Transaction();
+        const priorityFee = manualFee || await calculateDynamicPriorityFee();
+        transaction.add(solanaWeb3.ComputeBudgetProgram.setComputeUnitPrice({ microLamports: Math.floor(priorityFee) }));
+        transaction.add(new solanaWeb3.TransactionInstruction({
+          keys: [
+            { pubkey: publicKey, isSigner: true, isWritable: true },
+            { pubkey: new solanaWeb3.PublicKey(TOKEN_PROGRAM_ID), isSigner: false, isWritable: false }
+          ],
+          programId: new solanaWeb3.PublicKey(SWAP_PROGRAM_ID),
+          data: Buffer.from("swap_instruction_data_buy")
+        }));
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = publicKey;
+        const signed = await wallet.signTransaction(transaction);
+        const txid = await connection.sendRawTransaction(signed.serialize());
+        await connection.confirmTransaction(txid);
+        document.getElementById("tradeStatus").textContent += `Auto-buy executed for ${tokenMint} with fee ${priorityFee} micro-lamports: ${txid}\n`;
+        positions[tokenMint].entry_price = currentPrice;
+        positions[tokenMint].amount += 1000; // Placeholder
+      } catch (error) {
+        console.error(`Auto-buy failed for ${tokenMint}:`, error);
+        document.getElementById("tradeStatus").textContent += `Auto-buy failed for ${tokenMint}: ${error.message}\n`;
+      }
+    }
+
+    async function autoSellToken(tokenMint, manualFee = null) {
+      if (!wallet || !publicKey) {
+        document.getElementById("tradeStatus").textContent += "Error: Wallet not connected\n";
+        return;
+      }
+      try {
+        const transaction = new solanaWeb3.Transaction();
+        const priorityFee = manualFee || await calculateDynamicPriorityFee();
+        transaction.add(solanaWeb3.ComputeBudgetProgram.setComputeUnitPrice({ microLamports: Math.floor(priorityFee) }));
+        transaction.add(new solanaWeb3.TransactionInstruction({
+          keys: [
+            { pubkey: publicKey, isSigner: true, isWritable: true },
+            { pubkey: new solanaWeb3.PublicKey(TOKEN_PROGRAM_ID), isSigner: false, isWritable: false }
+          ],
+          programId: new solanaWeb3.PublicKey(SWAP_PROGRAM_ID),
+          data: Buffer.from("swap_instruction_data_sell")
+        }));
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = publicKey;
+        const signed = await wallet.signTransaction(transaction);
+        const txid = await connection.sendRawTransaction(signed.serialize());
+        await connection.confirmTransaction(txid);
+        document.getElementById("tradeStatus").textContent += `Auto-sold token ${tokenMint} with fee ${priorityFee} micro-lamports: ${txid}\n`;
+        positions[tokenMint].amount = 0;
+      } catch (error) {
+        console.error(`Auto-sell failed for ${tokenMint}:`, error);
+        document.getElementById("tradeStatus").textContent += `Auto-sell failed for ${tokenMint}: ${error.message}\n`;
+      }
+    }
+
+    async function getCurrentPrice(tokenMint) {
+      return await getMarketPrice(tokenMint, "USDC", 1.0);
+    }
+
+    async function getCurrentVolume(tokenMint) {
+      return 15000; // Placeholder
+    }
+
+    async function getMarketPrice(tokenIn, tokenOut, amountIn) {
+      try {
+        const response = await axios.get(JUPITER_API, {
+          params: { inputMint: tokenIn, outputMint: tokenOut, amount: amountIn * 1e9, slippageBps: 50 }
+        });
+        return response.data.data[0].outAmount / 1e6;
+      } catch {
+        return null;
+      }
+    }
+
+    function analyzeMevOpportunity(transaction) {
+      if (transaction && transaction.program_id === SWAP_PROGRAM_ID) {
+        const marketPrice = getMarketPrice(transaction.token_in, transaction.token_out, transaction.amount_in);
+        if (marketPrice && transaction.price < marketPrice) {
+          const profit = (marketPrice - transaction.price) * transaction.amount_in;
+          return { profit, tx_data: transaction, market_price: marketPrice };
+        }
+      }
+      return null;
+    }
+
+    async function executeSnipe(opportunity, manualFee = null) {
+      if (!wallet || !publicKey) {
+        document.getElementById("tradeStatus").textContent += "Error: Wallet not connected\n";
+        return;
+      }
+      try {
+        const transaction = new solanaWeb3.Transaction();
+        const priorityFee = manualFee || await calculateDynamicPriorityFee();
+        transaction.add(solanaWeb3.ComputeBudgetProgram.setComputeUnitPrice({ microLamports: Math.floor(priorityFee) }));
+        transaction.add(new solanaWeb3.TransactionInstruction({
+          keys: [
+            { pubkey: publicKey, isSigner: true, isWritable: true },
+            { pubkey: new solanaWeb3.PublicKey(TOKEN_PROGRAM_ID), isSigner: false, isWritable: false }
+          ],
+          programId: new solanaWeb3.PublicKey(SWAP_PROGRAM_ID),
+          data: Buffer.from("swap_instruction_data")
+        }));
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = publicKey;
+        const signed = await wallet.signTransaction(transaction);
+        const txid = await connection.sendRawTransaction(signed.serialize());
+        await connection.confirmTransaction(txid);
+        document.getElementById("tradeStatus").textContent += `Snipe executed with fee ${priorityFee} micro-lamports: ${txid}\n`;
+        const tokenMint = opportunity.tx_data.token_mint;
+        positions[tokenMint].entry_price = opportunity.market_price;
+        positions[tokenMint].amount += 1000;
+      } catch (error) {
+        console.error("Snipe failed:", error);
+        document.getElementById("tradeStatus").textContent += `Snipe failed: ${error.message}\n`;
+      }
+    }
+
+    // Event listener for wallet connection
+    document.getElementById("connectWallet").addEventListener("click", connectWallet);
+
+    // Start mempool monitoring
+    monitorMempool();
+  </script>
+</body>
+</html>
